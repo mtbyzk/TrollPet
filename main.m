@@ -75,20 +75,43 @@ static TPPersonaIdFunc TPGetPersonaIdFunc(const char *name) {
     return (TPPersonaIdFunc)dlsym(RTLD_DEFAULT, name);
 }
 
-// 状态目录：主 App 的 Library/TrollPet，启动 HUD 时通过 -stateDir 参数传给 root 进程
+// 逐个候选目录试写，选出真正可写的那个（无沙盒 App 的 Library 可能不是容器里的 Library）
+static NSString *TPWritableDirectory(NSString *candidate) {
+    if (candidate.length == 0) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm createDirectoryAtPath:candidate withIntermediateDirectories:YES attributes:nil error:nil]) {
+        return nil;
+    }
+    NSString *probe = [candidate stringByAppendingPathComponent:@".probe"];
+    NSString *payload = [NSString stringWithFormat:@"%d", getpid()];
+    BOOL ok = [payload writeToFile:probe atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [fm removeItemAtPath:probe error:nil];
+    return ok ? candidate : nil;
+}
+
+// 状态目录：优先 App 的 Library，不行就退到 tmp，保证一定能读写
 static NSString *TPStateDirectory(void) {
     static NSString *dir = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         NSString *library = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-        if (library.length == 0) {
-            library = NSTemporaryDirectory();
+        NSString *temporary = NSTemporaryDirectory();
+        NSArray<NSString *> *bases = @[ library ?: @"", temporary ?: @"", @"/tmp" ];
+        for (NSString *base in bases) {
+            NSString *candidate = [base stringByAppendingPathComponent:@"TrollPet"];
+            NSString *ok = TPWritableDirectory(candidate);
+            if (ok) {
+                dir = ok;
+                break;
+            }
         }
-        dir = [library stringByAppendingPathComponent:@"TrollPet"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:nil];
+        if (dir == nil) {
+            dir = [temporary stringByAppendingPathComponent:@"TrollPet"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES
+                                                       attributes:nil
+                                                            error:nil];
+        }
     });
     return dir;
 }
@@ -104,12 +127,23 @@ static NSString *TPFeedRequestPath(NSString *stateDir) { return TPFile(stateDir,
 static NSString *TPPidPath(NSString *stateDir) { return TPFile(stateDir, @"hud.pid"); }
 static NSString *TPLogPath(NSString *stateDir) { return TPFile(stateDir, @"hud.log"); }
 
+// 内存日志：即使沙盒 / 权限导致文件写不进去，界面上也能看到
+static NSMutableArray<NSString *> *gTPLogLines = nil;
+
 // 诊断日志：主 App 与 HUD 进程共用同一个文件，主 App 里可直接查看 / 复制
 static void TPAppendLog(NSString *stateDir, NSString *format, ...) {
     va_list args;
     va_start(args, format);
     NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
+
+    if (gTPLogLines == nil) {
+        gTPLogLines = [NSMutableArray array];
+    }
+    [gTPLogLines addObject:line];
+    if (gTPLogLines.count > 60) {
+        [gTPLogLines removeObjectAtIndex:0];
+    }
 
     NSString *path = TPLogPath(stateDir);
     NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
@@ -995,7 +1029,7 @@ static id TPRegisterHostingWindow(UIWindow *window, NSString *stateDir) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    self.title = @"顶部宠物";
+    self.title = @"顶部宠物 v3";
     self.view.backgroundColor = [UIColor colorWithWhite:0.07 alpha:1.0];
 
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -1122,6 +1156,8 @@ static id TPRegisterHostingWindow(UIWindow *window, NSString *stateDir) {
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
+    TPAppendLog(TPStateDirectory(), @"ui: viewDidAppear on=%d running=%d",
+                _enabledSwitch.isOn ? 1 : 0, TPHUDIsRunning() ? 1 : 0);
     // 开机后第一次打开 App，自动把宠物拉起来
     if (_enabledSwitch.isOn && !TPHUDIsRunning()) {
         [self applySettings];
@@ -1226,13 +1262,38 @@ static id TPRegisterHostingWindow(UIWindow *window, NSString *stateDir) {
 
 - (void)refreshDiagnostics {
     if (_diagView == nil) return;
-    NSString *text = [NSString stringWithContentsOfFile:TPLogPath(TPStateDirectory())
-                                                encoding:NSUTF8StringEncoding
-                                                   error:nil];
-    if (text.length == 0) {
-        text = @"（暂无日志）";
+
+    NSString *stateDir = TPStateDirectory();
+    NSString *logPath = TPLogPath(stateDir);
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    [lines addObject:@"== v3 自检 =="];
+    [lines addObject:[NSString stringWithFormat:@"dir=%@", stateDir]];
+    [lines addObject:[NSString stringWithFormat:@"uid=%d readVarMobile=%d", getuid(),
+                      [fm isReadableFileAtPath:@"/var/mobile"] ? 1 : 0]];
+    [lines addObject:[NSString stringWithFormat:@"logfile=%@", [fm fileExistsAtPath:logPath] ? @"exists" : @"missing"]];
+
+    // 写入探测：用单独文件试写，判断是否只是日志文件写不进去
+    NSString *probePath = TPFile(stateDir, @"probe.txt");
+    NSString *probe = [NSString stringWithFormat:@"p-%f", [[NSDate date] timeIntervalSince1970]];
+    NSError *probeError = nil;
+    BOOL probeOK = [probe writeToFile:probePath atomically:YES encoding:NSUTF8StringEncoding error:&probeError];
+    [lines addObject:[NSString stringWithFormat:@"probe=%@ %@", probeOK ? @"ok" : @"FAIL",
+                      probeError ? probeError.localizedDescription : @""]];
+
+    NSString *fileText = [NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:nil];
+    [lines addObject:@"-- file log --"];
+    [lines addObject:fileText.length > 0 ? fileText : @"(empty)"];
+
+    [lines addObject:@"-- memory log --"];
+    if (gTPLogLines.count > 0) {
+        [lines addObjectsFromArray:gTPLogLines];
+    } else {
+        [lines addObject:@"(empty)"];
     }
-    _diagView.text = text;
+
+    _diagView.text = [lines componentsJoinedByString:@"\n"];
 }
 
 - (void)copyDiagnostics {
@@ -1245,6 +1306,7 @@ static id TPRegisterHostingWindow(UIWindow *window, NSString *stateDir) {
 #pragma mark - 交互
 
 - (void)enabledChanged:(UISwitch *)sender {
+    TPAppendLog(TPStateDirectory(), @"ui: switch=%d", sender.isOn ? 1 : 0);
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:@"enabled"];
     [self applySettings];
 }
@@ -1287,6 +1349,11 @@ static id TPRegisterHostingWindow(UIWindow *window, NSString *stateDir) {
 
     [self refreshStatus];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *pidText = [NSString stringWithContentsOfFile:TPPidPath(TPStateDirectory())
+                                                       encoding:NSUTF8StringEncoding
+                                                          error:nil];
+        TPAppendLog(TPStateDirectory(), @"ui: after1s pid=%@ alive=%d", pidText.length > 0 ? pidText : @"nil",
+                    TPHUDIsRunning() ? 1 : 0);
         [self refreshStatus];
     });
 }
