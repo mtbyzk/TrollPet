@@ -1,0 +1,38 @@
+name: Build TrollPet IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build IPA
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          APP="build/Payload/TrollPet.app"
+          mkdir -p "$APP"
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" \
+            -fobjc-arc -O2 -framework UIKit -framework Foundation -framework QuartzCore \
+            -framework CoreGraphics -framework CoreFoundation \
+            main.m -o "$APP/TrollPet"
+          cp Info.plist "$APP/Info.plist"
+          if [ -f icon.png ]; then cp icon.png "$APP/icon.png"; fi
+          ldid -S"entitlements.plist" "$APP/TrollPet"
+          cd build && zip -qry TrollPet.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollPet-ipa
+          path: build/TrollPet.ipa
+          if-no-files-found: error
