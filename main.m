@@ -15,6 +15,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <spawn.h>
+#import <unistd.h>
 #import <signal.h>
 #import <errno.h>
 #import <limits.h>
@@ -35,12 +36,17 @@
 - (void)feed;
 @end
 
+@interface TPPassthroughView : UIView
+@end
+
 @interface TPOverlayViewController : UIViewController
 @property (nonatomic, strong, readonly) TPPetView *petView;
 - (instancetype)initWithStateDir:(NSString *)stateDir;
+- (void)layoutPetWithScale:(double)scale topOffset:(double)offset;
 @end
 
 @interface TPHUDAppDelegate : UIResponder <UIApplicationDelegate>
+@property (nonatomic, strong) UIWindow *window;
 @end
 
 @interface TPMainAppDelegate : UIResponder <UIApplicationDelegate>
@@ -48,6 +54,8 @@
 @end
 
 @interface TPMainViewController : UIViewController
+- (void)refreshDiagnostics;
+- (void)copyDiagnostics;
 @end
 
 #pragma mark - 状态目录与配置（原 TPRuntime）
@@ -94,6 +102,31 @@ static NSString *TPPetStatePath(NSString *stateDir) { return TPFile(stateDir, @"
 static NSString *TPStopRequestPath(NSString *stateDir) { return TPFile(stateDir, @"stop.request"); }
 static NSString *TPFeedRequestPath(NSString *stateDir) { return TPFile(stateDir, @"feed.request"); }
 static NSString *TPPidPath(NSString *stateDir) { return TPFile(stateDir, @"hud.pid"); }
+static NSString *TPLogPath(NSString *stateDir) { return TPFile(stateDir, @"hud.log"); }
+
+// 诊断日志：主 App 与 HUD 进程共用同一个文件，主 App 里可直接查看 / 复制
+static void TPAppendLog(NSString *stateDir, NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSString *path = TPLogPath(stateDir);
+    NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSString *content = existing.length > 0 ? existing : @"";
+    NSArray<NSString *> *old = [content componentsSeparatedByString:@"\n"];
+    if (old.count > 40) {
+        content = [[old subarrayWithRange:NSMakeRange(old.count - 40, 40)] componentsJoinedByString:@"\n"];
+    }
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+    NSString *stamp = [fmt stringFromDate:[NSDate date]];
+    NSString *next = [content stringByAppendingFormat:@"%@ %@\n", stamp, line];
+    [next writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static CGFloat TPStatusBarHeight(void);   // 定义在 HUD 段，这里先声明供悬浮层布局使用
 
 static NSDictionary *TPReadConfig(NSString *stateDir) {
     NSDictionary *raw = [NSDictionary dictionaryWithContentsOfFile:TPConfigPath(stateDir)];
@@ -124,30 +157,25 @@ static BOOL TPHUDIsRunning(void) {
     return errno == EPERM;
 }
 
-static void TPStartHUD(NSString *stateDir, double scale, double topOffset) {
-    if (TPHUDIsRunning()) {
-        TPWriteConfig(stateDir, scale, topOffset);
-        return;
-    }
-    [[NSFileManager defaultManager] removeItemAtPath:TPStopRequestPath(stateDir) error:nil];
-    [[NSFileManager defaultManager] removeItemAtPath:TPFeedRequestPath(stateDir) error:nil];
-    TPWriteConfig(stateDir, scale, topOffset);
+// 最近一次启动失败的原因，主界面直接显示出来（用户截图即可，不必懂日志）
+static NSString *gTPLastStartError = nil;
 
-    char exePath[PATH_MAX] = {0};
-    uint32_t exePathSize = sizeof(exePath);
-    if (_NSGetExecutablePath(exePath, &exePathSize) != 0) return;
-
+static int TPSpawnHUD(NSString *stateDir, const char *exePath, BOOL rootPersona,
+                      double scale, double topOffset, pid_t *outPid) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
 
-    // persona 提权：uid/gid 置 0，让 HUD 以 root 运行（否则解锁时会被 SpringBoard 杀掉）
-    TPPersonaNpFunc personaNP = TPGetPersonaNpFunc("posix_spawnattr_set_persona_np");
-    TPPersonaIdFunc personaUID = TPGetPersonaIdFunc("posix_spawnattr_set_persona_uid_np");
-    TPPersonaIdFunc personaGID = TPGetPersonaIdFunc("posix_spawnattr_set_persona_gid_np");
-    if (personaNP && personaUID && personaGID) {
-        personaNP(&attr, 99, 1); // POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE == 1
-        personaUID(&attr, 0);
-        personaGID(&attr, 0);
+    if (rootPersona) {
+        // persona 提权：uid/gid 置 0，让 HUD 以 root 运行（否则解锁时会被 SpringBoard 杀掉）
+        TPPersonaNpFunc personaNP = TPGetPersonaNpFunc("posix_spawnattr_set_persona_np");
+        TPPersonaIdFunc personaUID = TPGetPersonaIdFunc("posix_spawnattr_set_persona_uid_np");
+        TPPersonaIdFunc personaGID = TPGetPersonaIdFunc("posix_spawnattr_set_persona_gid_np");
+        TPAppendLog(stateDir, @"main: persona api=%d", personaNP && personaUID && personaGID ? 1 : 0);
+        if (personaNP && personaUID && personaGID) {
+            personaNP(&attr, 99, 1); // POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE == 1
+            personaUID(&attr, 0);
+            personaGID(&attr, 0);
+        }
     }
 
     posix_spawnattr_setpgroup(&attr, 0);
@@ -166,13 +194,58 @@ static void TPStartHUD(NSString *stateDir, double scale, double topOffset) {
 
     pid_t pid = 0;
     int rc = posix_spawn(&pid, exePath, NULL, &attr, (char **)args, environ);
+    int spawnErrno = rc != 0 ? errno : 0;
     posix_spawnattr_destroy(&attr);
 
-    if (rc == 0 && pid > 0) {
-        // 不要 waitpid，让 HUD 自己跑
-        NSString *pidText = [NSString stringWithFormat:@"%d", pid];
-        [pidText writeToFile:TPPidPath(stateDir) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    TPAppendLog(stateDir, @"main: spawn root=%d rc=%d errno=%d(%s) pid=%d uid=%d",
+                rootPersona ? 1 : 0, rc, spawnErrno,
+                rc != 0 ? strerror(spawnErrno) : "ok", pid, getuid());
+
+    if (outPid) *outPid = pid;
+    return rc;
+}
+
+static BOOL TPStartHUD(NSString *stateDir, double scale, double topOffset) {
+    if (TPHUDIsRunning()) {
+        TPWriteConfig(stateDir, scale, topOffset);
+        gTPLastStartError = nil;
+        return YES;
     }
+    [[NSFileManager defaultManager] removeItemAtPath:TPStopRequestPath(stateDir) error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:TPFeedRequestPath(stateDir) error:nil];
+    TPWriteConfig(stateDir, scale, topOffset);
+
+    char exePath[PATH_MAX] = {0};
+    uint32_t exePathSize = sizeof(exePath);
+    if (_NSGetExecutablePath(exePath, &exePathSize) != 0) {
+        gTPLastStartError = @"取不到可执行文件路径";
+        TPAppendLog(stateDir, @"main: _NSGetExecutablePath failed");
+        return NO;
+    }
+
+    TPAppendLog(stateDir, @"main: start hud uid=%d exe=%s", getuid(), exePath);
+
+    pid_t pid = 0;
+    int rc = TPSpawnHUD(stateDir, exePath, YES, scale, topOffset, &pid);
+    BOOL rootPersona = YES;
+    if (rc != 0) {
+        // root 提权失败时再退一步：用普通身份启动，至少能确认 HUD 窗口本身是否正常
+        rootPersona = NO;
+        rc = TPSpawnHUD(stateDir, exePath, NO, scale, topOffset, &pid);
+    }
+
+    if (rc != 0 || pid <= 0) {
+        gTPLastStartError = [NSString stringWithFormat:@"rc=%d (%s)", rc, strerror(errno)];
+        TPAppendLog(stateDir, @"main: start failed rc=%d", rc);
+        return NO;
+    }
+
+    gTPLastStartError = nil;
+    // 不要 waitpid，让 HUD 自己跑
+    NSString *pidText = [NSString stringWithFormat:@"%d", pid];
+    [pidText writeToFile:TPPidPath(stateDir) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    TPAppendLog(stateDir, @"main: hud pid=%d root=%d", pid, rootPersona ? 1 : 0);
+    return YES;
 }
 
 static void TPStopHUD(NSString *stateDir) {
@@ -570,22 +643,59 @@ static void TPFillTriangle(CGContextRef ctx, CGPoint a, CGPoint b, CGPoint c, UI
 
 #pragma mark - 悬浮层控制器（原 TPOverlayViewController）
 
-@implementation TPOverlayViewController
+@implementation TPPassthroughView
+
+// 只有落到宠物身上的触摸才被吃掉，其余交给下层 App
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit == self ? nil : hit;
+}
+
+@end
+
+@implementation TPOverlayViewController {
+    double _lastScale;
+    double _lastOffset;
+}
 
 - (instancetype)initWithStateDir:(NSString *)stateDir {
     self = [super init];
     if (self) {
         _petView = [[TPPetView alloc] initWithStatePath:TPPetStatePath(stateDir)];
 
-        UIView *root = [[UIView alloc] initWithFrame:CGRectZero];
+        // 窗口铺满全屏、背景透明，宠物只占顶部一小块；
+        // 空白区域的 hitTest 返回 nil，触摸就会穿透到下面的 App
+        TPPassthroughView *root = [[TPPassthroughView alloc] initWithFrame:CGRectZero];
         root.backgroundColor = [UIColor clearColor];
         self.view = root;
 
-        _petView.frame = root.bounds;
-        _petView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        // 窗口铺满全屏、背景透明，宠物只占顶部一小块；窗口其余区域 hitTest 返回 nil 实现穿透
+        _petView.autoresizingMask = UIViewAutoresizingNone;
+        _petView.backgroundColor = [UIColor clearColor];
         [root addSubview:_petView];
     }
     return self;
+}
+
+- (void)layoutPetWithScale:(double)scale topOffset:(double)offset {
+    _lastScale = scale;
+    _lastOffset = offset;
+
+    CGRect bounds = self.view.bounds;
+    if (CGRectGetWidth(bounds) <= 0.0) {
+        // 窗口还没完成第一次布局时，退回用屏幕尺寸计算
+        bounds = [UIScreen mainScreen].bounds;
+    }
+    CGFloat side = 112.0 * scale;
+    CGFloat top = TPStatusBarHeight() + offset;
+    _petView.frame = CGRectMake((CGRectGetWidth(bounds) - side) * 0.5, top, side, side);
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (_lastScale > 0.0) {
+        [self layoutPetWithScale:_lastScale topOffset:_lastOffset];
+    }
 }
 
 - (BOOL)prefersStatusBarHidden {
@@ -687,7 +797,7 @@ static CGFloat TPStatusBarHeight(void) {
 }
 
 // 用 SBSAccessibilityWindowHostingController 把窗口注册进 SpringBoard 的辅助功能托管层
-static id TPRegisterHostingWindow(UIWindow *window) {
+static id TPRegisterHostingWindow(UIWindow *window, NSString *stateDir) {
     Class hostingClass = objc_getClass("SBSAccessibilityWindowHostingController");
     if (!hostingClass) {
         // 类不在当前进程时，手动加载提供它的私有框架再取一次
@@ -696,10 +806,16 @@ static id TPRegisterHostingWindow(UIWindow *window) {
             hostingClass = objc_getClass("SBSAccessibilityWindowHostingController");
         }
     }
-    if (!hostingClass) return nil;
+    if (!hostingClass) {
+        TPAppendLog(stateDir, @"hud: hostingClass missing");
+        return nil;
+    }
 
     id controller = [[hostingClass alloc] init];
-    if (!controller) return nil;
+    if (!controller) {
+        TPAppendLog(stateDir, @"hud: hostingController nil");
+        return nil;
+    }
 
     unsigned int contextId = 0;
     SEL contextSelector = NSSelectorFromString(@"_contextId");
@@ -709,7 +825,10 @@ static id TPRegisterHostingWindow(UIWindow *window) {
 
     double level = window.windowLevel;
     SEL registerSelector = NSSelectorFromString(@"registerWindowWithContextID:atLevel:");
-    if (![controller respondsToSelector:registerSelector]) return controller;
+    if (![controller respondsToSelector:registerSelector]) {
+        TPAppendLog(stateDir, @"hud: register selector missing contextId=%u", contextId);
+        return controller;
+    }
 
     NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:"v@:Id"];
     NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
@@ -719,11 +838,11 @@ static id TPRegisterHostingWindow(UIWindow *window) {
     [invocation setArgument:&level atIndex:3];
     [invocation invoke];
 
+    TPAppendLog(stateDir, @"hud: register ctx=%u level=%.0f", contextId, level);
     return controller;
 }
 
 @implementation TPHUDAppDelegate {
-    TPHUDWindow *_window;
     TPOverlayViewController *_overlay;
     NSTimer *_watcher;
     NSString *_stateDir;
@@ -735,22 +854,41 @@ static id TPRegisterHostingWindow(UIWindow *window) {
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     [self tp_parseArguments];
 
-    _overlay = [[TPOverlayViewController alloc] initWithStateDir:_stateDir];
-    _window = [[TPHUDWindow alloc] initWithFrame:CGRectZero];
-    _window.rootViewController = _overlay;
-    _window.backgroundColor = [UIColor clearColor];
-    _window.windowLevel = 10000010.0;
+    TPAppendLog(_stateDir, @"hud: launch pid=%d uid=%d", getpid(), getuid());
 
-    // 先确定尺寸再显示：窗口在可见之前就创建窗口上下文，尺寸才正确
+    _overlay = [[TPOverlayViewController alloc] initWithStateDir:_stateDir];
+
+    // 全屏透明窗口 + 顶部宠物视图，与 TrollSpeed 的 HUD 窗口保持一致
+    TPHUDWindow *window = [[TPHUDWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    window.rootViewController = _overlay;
+    window.backgroundColor = [UIColor clearColor];
+    window.windowLevel = 10000010.0;
+    self.window = window;
+
     [self tp_layoutWindow];
-    [_window makeKeyAndVisible];
-    gWindowHostingController = TPRegisterHostingWindow(_window);
+    [window setHidden:NO];
+    [window makeKeyAndVisible];
+
+    TPAppendLog(_stateDir, @"hud: window frame=%@ level=%.0f key=%d",
+                NSStringFromCGRect(window.bounds), window.windowLevel, window.isKeyWindow);
+
+    gWindowHostingController = TPRegisterHostingWindow(window, _stateDir);
+
+    TPAppendLog(_stateDir, @"hud: hosted=%d", gWindowHostingController ? 1 : 0);
 
     _watcher = [NSTimer scheduledTimerWithTimeInterval:0.6
                                                  target:self
                                                selector:@selector(tp_onWatchTimer:)
                                                userInfo:nil
                                                 repeats:YES];
+
+    // 2 秒后复核一次，确认窗口与宠物视图真的存在尺寸（这是 HUD 不出来时最关键的一条）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        TPAppendLog(self->_stateDir, @"hud: tick hidden=%d win=%@ pet=%@",
+                    window.hidden, NSStringFromCGRect(window.bounds),
+                    NSStringFromCGRect(self->_overlay.petView.frame));
+    });
+
     return YES;
 }
 
@@ -794,10 +932,8 @@ static id TPRegisterHostingWindow(UIWindow *window) {
 }
 
 - (void)tp_layoutWindow {
-    CGRect screen = [UIScreen mainScreen].bounds;
-    CGFloat side = 112.0 * _scale;
-    CGFloat top = TPStatusBarHeight() + _topOffset;
-    _window.frame = CGRectMake((CGRectGetWidth(screen) - side) * 0.5, top, side, side);
+    // 窗口本身铺满全屏（保持窗口上下文尺寸正常），宠物视图负责定位在顶部
+    [_overlay layoutPetWithScale:_scale topOffset:_topOffset];
 }
 
 #pragma mark - 控制文件轮询
@@ -812,7 +948,7 @@ static id TPRegisterHostingWindow(UIWindow *window) {
         [fileManager removeItemAtPath:TPPidPath(_stateDir) error:nil];
         [timer invalidate];
         _watcher = nil;
-        _window.hidden = YES;
+        self.window.hidden = YES;
         exit(0);
     }
 
@@ -853,6 +989,7 @@ static id TPRegisterHostingWindow(UIWindow *window) {
     UILabel *_offsetValueLabel;
     UILabel *_statusLabel;
     UIButton *_feedButton;
+    UITextView *_diagView;
 }
 
 - (void)viewDidLoad {
@@ -941,8 +1078,29 @@ static id TPRegisterHostingWindow(UIWindow *window) {
                                   weight:UIFontWeightRegular
                                   color:[UIColor colorWithWhite:0.45 alpha:1.0]];
 
+    // 诊断区：宠物没出现时，点"复制诊断信息"把这段文字发给我即可定位问题
+    UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [copyButton setTitle:@"复制诊断信息" forState:UIControlStateNormal];
+    copyButton.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
+    [copyButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    copyButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10];
+    copyButton.layer.cornerRadius = 10.0;
+    [copyButton.heightAnchor constraintEqualToConstant:38.0].active = YES;
+    [copyButton addTarget:self action:@selector(copyDiagnostics) forControlEvents:UIControlEventTouchUpInside];
+
+    _diagView = [[UITextView alloc] init];
+    _diagView.editable = NO;
+    _diagView.scrollEnabled = YES;
+    _diagView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
+    _diagView.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
+    _diagView.font = [UIFont monospacedSystemFontOfSize:10.5 weight:UIFontWeightRegular];
+    _diagView.layer.cornerRadius = 10.0;
+    _diagView.textContainerInset = UIEdgeInsetsMake(8.0, 8.0, 8.0, 8.0);
+    _diagView.text = @"（暂无日志）";
+    [_diagView.heightAnchor constraintEqualToConstant:140.0].active = YES;
+
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        headline, description, switchRow, scaleRow, offsetRow, _feedButton, _statusLabel, hint
+        headline, description, switchRow, scaleRow, offsetRow, _feedButton, _statusLabel, copyButton, _diagView, hint
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 18.0;
@@ -1034,8 +1192,16 @@ static id TPRegisterHostingWindow(UIWindow *window) {
 
 - (void)refreshStatus {
     NSFileManager *fileManager = [NSFileManager defaultManager];
+
+    // 诊断信息：无论运行与否都显示，出问题时把这行文字复制出来即可定位
+    [self refreshDiagnostics];
+
     if (!TPHUDIsRunning()) {
-        _statusLabel.text = @"状态：未运行";
+        if (gTPLastStartError.length > 0) {
+            _statusLabel.text = [NSString stringWithFormat:@"状态：启动失败 %@", gTPLastStartError];
+        } else {
+            _statusLabel.text = @"状态：未运行";
+        }
         _feedButton.enabled = NO;
         _feedButton.alpha = 0.5;
         return;
@@ -1056,6 +1222,24 @@ static id TPRegisterHostingWindow(UIWindow *window) {
         }
     }
     _statusLabel.text = [NSString stringWithFormat:@"状态：运行中 · 饥饿度 %.0f%%", hunger];
+}
+
+- (void)refreshDiagnostics {
+    if (_diagView == nil) return;
+    NSString *text = [NSString stringWithContentsOfFile:TPLogPath(TPStateDirectory())
+                                                encoding:NSUTF8StringEncoding
+                                                   error:nil];
+    if (text.length == 0) {
+        text = @"（暂无日志）";
+    }
+    _diagView.text = text;
+}
+
+- (void)copyDiagnostics {
+    UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
+    pasteboard.string = _diagView.text.length > 0 ? _diagView.text : @"（暂无日志）";
+    UIImpactFeedbackGenerator *generator = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [generator impactOccurred];
 }
 
 #pragma mark - 交互
@@ -1114,6 +1298,8 @@ static id TPRegisterHostingWindow(UIWindow *window) {
 @implementation TPMainAppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    TPAppendLog(TPStateDirectory(), @"main: app launched uid=%d", getuid());
+
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
 
     TPMainViewController *viewController = [[TPMainViewController alloc] init];
